@@ -1,3 +1,84 @@
+"""Practice analytics and PNG chart generation.
+
+The public functions in this module turn persisted answer attempts into personal
+or global summaries for the two ``/api/analytics`` endpoints. The data flow is:
+
+1. ``_read_attempts`` opens the application's configured SQLite or PostgreSQL
+   database and uses ``pandas.read_sql`` to load attempts joined to their deck
+   and card metadata. Joining here gives later calculations subject, difficulty,
+   deck title, and question text without separate per-row queries.
+2. ``analyze_personal_attempts`` filters that DataFrame to one learner and
+   computes their metrics. ``analyze_global_attempts`` groups all attempts into
+   aggregate metrics; it returns no user identifiers, selected answers, or
+   attempt-level records.
+3. ``_make_charts`` renders the summaries into PNG images encoded as
+   ``data:image/png;base64,...`` URIs. The API returns these URIs alongside the
+   numeric data, so the browser can display the charts without a separate
+   image endpoint.
+4. ``get_personal_analytics`` and ``get_global_analytics`` cache completed
+   results for 60 seconds. Cache keys include the database identity and theme
+   (and, for personal results, the user ID). A short-lived cache limits repeated
+   SQL reads and chart rendering while naturally expiring stale summaries.
+
+Pandas calculations:
+
+* The attempt rows are held in a DataFrame. ``to_datetime(..., utc=True)``
+  normalizes timestamps, ``to_numeric`` safely parses response durations, and
+  ``groupby(...).agg(...)`` computes attempt and correct-answer counts. Accuracy
+  is ``correct / attempts * 100``. Personal accuracy is also grouped by deck,
+  subject, and card difficulty; hint-usage rate is the percentage of attempts
+  with at least one hint.
+* Grouping timestamps by their UTC calendar date produces daily activity.
+  Sorting a learner's attempts in timestamp order and applying an expanding
+  mean gives cumulative accuracy at each attempt, which is the learning-curve
+  series.
+* Global subject accuracy is pooled across attempts (all correct answers divided
+  by all attempts in the subject). A question is included among the ten
+  hardest only after at least three attempts, then the lowest-accuracy questions
+  are returned first. The ten days with the most attempts are also returned.
+* For personal rank, attempts are grouped by user to sum awarded points, then
+  ``Series.rank(method="min", ascending=False)`` assigns competition ranks:
+  learners tied on points share the same rank, and the next rank skips the tied
+  positions.
+
+NumPy calculations:
+
+* ``np.percentile`` calculates the 50th, 90th, and 95th percentiles of valid
+  response times in milliseconds. These describe typical and slower response
+  times without relying only on an average that can be skewed by outliers.
+* ``np.arange`` numbers the learner's ordered attempts for plotting. ``np.polyfit``
+  fits a degree-one line to attempt number versus cumulative accuracy; its slope
+  (percentage points per attempt) is returned as ``learning_curve_trend_slope``
+  and the fitted line is drawn over the chart. The slope is zero when fewer
+  than two attempts exist.
+* ``np.where`` flags a card as weak only when its observed accuracy is below
+  50% and it has at least three attempts. This minimum sample size avoids
+  labeling a card from one early mistake.
+* ``np.histogram`` bins each learner's total points for the global points
+  distribution. The same kind of histogram is used for response-time charts.
+
+Matplotlib rendering:
+
+* The module selects the ``Agg`` backend before importing ``pyplot``. Agg renders
+  images in memory without a window system or GUI, which is suitable for API
+  servers and deployment environments.
+* ``_chart`` creates a consistently sized figure and applies either the light
+  pink/blue palette or the dark palette. ``_render_charts`` builds bar charts
+  for accuracy by subject and daily activity, a cumulative-accuracy line chart
+  with its NumPy trend line, and histograms for response times and (globally)
+  points. Empty datasets still produce valid blank chart images.
+* ``_png_data_uri`` writes each figure to an in-memory byte buffer as PNG,
+  closes the figure to release resources, and Base64-encodes the bytes as a
+  browser-displayable data URI. A lock serializes Matplotlib rendering because
+  pyplot maintains shared process-level state.
+
+Personal analytics with no attempts returns a stable zero/empty result, null
+response-time percentiles, no rank, and valid empty-state chart images. The
+global endpoint likewise returns empty aggregates and charts when there are no
+attempts. Both behaviors let the frontend render a new learner or empty class
+without special database setup.
+"""
+
 import base64
 import io
 import threading
